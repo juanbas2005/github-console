@@ -44,6 +44,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # actions/checkout deja el GITHUB_TOKEN en .git/config (extraheader).
+      # El sandbox es una copia SIN .git, pero así tampoco se puede leer la
+      # credencial por ruta absoluta (p.ej. cat /home/runner/work/.../.git/config).
+      - name: Eliminar credenciales persistidas del workspace
+        run: git config --unset-all "http.https://github.com/.extraheader" || true
+
       - name: Instalar herramientas GUI (opcional)
         if: vars.CONSOLE_INSTALL_GUI_TOOLS == 'true'
         run: |

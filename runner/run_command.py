@@ -64,7 +64,7 @@ SAFE_ENV_KEYS = {
 }
 SAFE_PATH_CORE = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games"
 
-_UNSHARE_OK = None
+_UNSHARE_ARGS = None
 
 
 def compute_safe_path() -> str:
@@ -257,33 +257,47 @@ def rlimits_preexec(cpu_seconds: int, fsize_bytes: int, as_bytes: int) -> None:
         pass  # ponytail: los límites son defensa en profundidad, no críticales
 
 
-def unshare_available() -> bool:
-    """Probe único: ¿podemos aislar en un namespace PID+mount?"""
-    global _UNSHARE_OK
-    if _UNSHARE_OK is None:
+def unshare_args() -> list | None:
+    """Probe único: ¿podemos aislar en un namespace PID+mount?
+
+    En los runners hosted los jobs NO son root, así que probamos primero un
+    namespace de usuario sin privilegios (--user --map-root-user) y, si no,
+    el variante clásica (requiere root)."""
+    global _UNSHARE_ARGS
+    if _UNSHARE_ARGS is None:
         binary = shutil.which("unshare", path=compute_safe_path())
-        if not binary:
-            _UNSHARE_OK = False
-        else:
+        variants = [
+            ["--user", "--map-root-user", "--pid", "--fork", "--mount-proc"],
+            ["--pid", "--fork", "--mount-proc"],
+        ]
+        chosen = None
+        if binary:
             true_bin = shutil.which("true", path=compute_safe_path()) or "/bin/true"
-            try:
-                probe = subprocess.run(
-                    [binary, "--pid", "--fork", "--mount-proc", true_bin],
-                    capture_output=True, timeout=10)
-                _UNSHARE_OK = probe.returncode == 0
-            except Exception:
-                _UNSHARE_OK = False
-    return _UNSHARE_OK
+            for variant in variants:
+                try:
+                    probe = subprocess.run(
+                        [binary, *variant, true_bin],
+                        capture_output=True, timeout=10)
+                    if probe.returncode == 0:
+                        chosen = variant
+                        break
+                except Exception:
+                    continue
+        _UNSHARE_ARGS = chosen
+    return _UNSHARE_ARGS
 
 
 def wrap_unshare(argv: list) -> list:
     """Aísla el comando en un namespace PID+mount propio: el comando no puede
     leer /proc de procesos ancestros (donde podría haber tokens).
     Si el runner no lo permite, se ejecuta sin namespace y se deja constancia."""
-    if os.environ.get("CONSOLE_USE_UNSHARE", "1") != "1" or not unshare_available():
+    if os.environ.get("CONSOLE_USE_UNSHARE", "1") != "1":
+        return argv
+    args = unshare_args()
+    if not args:
         return argv
     binary = shutil.which("unshare", path=compute_safe_path())
-    return [binary, "--pid", "--fork", "--mount-proc", "--", *argv]
+    return [binary, *args, "--", *argv]
 
 
 # --------------------------------------------------------------------------- #
@@ -395,19 +409,32 @@ def collect_artifacts(sandbox: Path, run_dir: Path) -> list:
 # Persistencia (git)
 # --------------------------------------------------------------------------- #
 
+def git_env() -> dict:
+    """Entorno para los subprocesos git. El token viaja por GIT_CONFIG_* (env),
+    nunca en argv (lo vería `ps`) ni en archivos del workspace."""
+    env = dict(os.environ)
+    token = os.environ.get("GITHUB_TOKEN")
+    if token:
+        env["GIT_CONFIG_COUNT"] = "1"
+        env["GIT_CONFIG_KEY_0"] = "http.https://github.com/.extraheader"
+        env["GIT_CONFIG_VALUE_0"] = f"AUTHORIZATION: Bearer {token}"
+    return env
+
+
 def git_commit(workspace: Path, rel_path: str, message: str) -> None:
     git = ["git", "-C", str(workspace)]
+    env = git_env()
     subprocess.run(git + ["add", "-f", "--", rel_path], check=True, capture_output=True)
     result = subprocess.run(
         git + ["commit", "-q", "-m", message, "--", rel_path],
-        capture_output=True, text=True,
+        capture_output=True, text=True, env=env,
     )
     if result.returncode != 0:
         return  # Nada que commitear (sin cambios)
-    push = subprocess.run(git + ["push", "-q"], capture_output=True, text=True)
+    push = subprocess.run(git + ["push", "-q"], capture_output=True, text=True, env=env)
     if push.returncode != 0:  # ponytail: reintento simple tras rebase
-        subprocess.run(git + ["pull", "-q", "--rebase"], capture_output=True, text=True)
-        subprocess.run(git + ["push", "-q"], capture_output=True, text=True)
+        subprocess.run(git + ["pull", "-q", "--rebase"], capture_output=True, text=True, env=env)
+        subprocess.run(git + ["push", "-q"], capture_output=True, text=True, env=env)
 
 
 def write_json(path: Path, payload: dict) -> None:
@@ -451,9 +478,11 @@ def main() -> int:
         },
         "repo": os.environ.get("GITHUB_REPOSITORY", ""),
         "sandbox": {
-            "pid_namespace": unshare_available(),
+            "pid_namespace": bool(unshare_args()),
+            "namespace_mode": (unshare_args() or ["disabled"])[0],
             "clean_workspace_copy": True,
             "env_scrubbed": True,
+            "workspace_credentials_removed": True,
         },
         "run_url": (
             f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/actions/runs/"
@@ -561,8 +590,9 @@ def main() -> int:
         subprocess.run(["git", "-C", str(workspace), "add", "--", rel_run_dir],
                        capture_output=True)
         subprocess.run(["git", "-C", str(workspace), "commit", "-q", "-m",
-                        f"console: error {args.id}"], capture_output=True)
-        subprocess.run(["git", "-C", str(workspace), "push", "-q"], capture_output=True)
+                        f"console: error {args.id}"], capture_output=True, env=git_env())
+        subprocess.run(["git", "-C", str(workspace), "push", "-q"],
+                       capture_output=True, env=git_env())
         return 2
     finally:
         sandbox_dir = os.environ.get("CONSOLE_SANDBOX_DIR")

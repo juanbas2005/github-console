@@ -1,0 +1,31 @@
+# Poda runs/ antiguos para que el repo no crezca indefinidamente.
+name: cleanup-runs
+
+on:
+  schedule:
+    - cron: "17 3 * * *"  # Diario 03:17 UTC
+  workflow_dispatch:
+    inputs:
+      days:
+        description: "Días de retención"
+        required: false
+        default: "7"
+
+permissions:
+  contents: write
+
+jobs:
+  prune:
+    runs-on: ubuntu-latest
+    if: github.repository_owner == github.actor || github.event_name == 'schedule'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Podar runs antiguos
+        run: |
+          python3 runner/prune_runs.py \
+            --runs-dir "$GITHUB_WORKSPACE/runs" \
+            --days "${{ github.event.inputs.days || vars.CONSOLE_RUNS_RETENTION_DAYS || '7' }}"
+        env:
+          DAYS: ${{ github.event.inputs.days }}

@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>GitHub Console</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⬡</text></svg>" />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div id="app">
+      <header id="topbar">
+        <span id="brand">⬡ github-console</span>
+        <span id="status" class="st-idle" title="Estado de la última ejecución">● idle</span>
+        <span id="whoami" title="Usuario autenticado">no autenticado</span>
+        <button id="settings-btn" title="Configuración (token, repo)">⚙</button>
+      </header>
+
+      <main id="terminal" aria-live="polite" tabindex="-1"></main>
+
+      <div id="input-line">
+        <span id="prompt"></span>
+        <input
+          id="cmd"
+          type="text"
+          autofocus
+          autocomplete="off"
+          autocorrect="off"
+          autocapitalize="off"
+          spellcheck="false"
+          placeholder="escribe un comando… (usa 'help')"
+          aria-label="Entrada de comando"
+        />
+      </div>
+
+      <footer id="hint">
+        ↑/↓ historial · Ctrl+L limpiar · 'auth' configurar token · 'help' ayuda
+      </footer>
+    </div>
+
+    <div id="settings-modal" hidden>
+      <div class="modal-card">
+        <h2>Configuración</h2>
+        <p class="note">
+          Tu token <strong>se guarda solo en este navegador</strong> (localStorage)
+          y solo se envía a <code>api.github.com</code>. Nunca se incluye en el
+          repositorio ni en el código de la página.
+        </p>
+        <label>
+          Token de GitHub (PAT de grano fino recomendado)
+          <input id="set-token" type="password" autocomplete="off"
+            placeholder="github_pat_… o ghp_…" />
+        </label>
+        <p class="subnote">
+          Permisos mínimos del PAT: <code>Actions</code> (read/write) y
+          <code>Contents</code> (read). Ámbito: solo este repositorio.
+        </p>
+        <label>Owner <input id="set-owner" type="text" placeholder="autodetectado" /></label>
+        <label>Repo <input id="set-repo" type="text" placeholder="autodetectado" /></label>
+        <label>Rama de salidas <input id="set-branch" type="text" placeholder="rama principal" /></label>
+        <div class="modal-actions">
+          <button id="set-save" class="primary">Guardar</button>
+          <button id="set-clear">Borrar token</button>
+          <button id="set-close">Cerrar</button>
+        </div>
+        <p class="subnote" id="set-verify"></p>
+      </div>
+    </div>
+
+    <script src="config.js"></script>
+    <script src="app.js"></script>
+  </body>
+</html>

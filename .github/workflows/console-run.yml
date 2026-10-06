@@ -1,0 +1,73 @@
+# Ejecuta comandos enviados desde la consola web.
+# Disparado por repository_dispatch (frontend) o manualmente (workflow_dispatch).
+name: console-run
+
+on:
+  repository_dispatch:
+    types: [console_run]
+  workflow_dispatch:
+    inputs:
+      command:
+        description: "Comando a ejecutar en el runner"
+        required: true
+        default: "ls -la"
+
+# GITHUB_TOKEN necesita contents:write para commitear la salida (runs/).
+permissions:
+  contents: write
+  actions: read
+
+# Solo una ejecución a la vez: serializa el acceso y limita el abuso
+# (cola natural + cuota de Actions del repositorio).
+concurrency:
+  group: console-run
+  cancel-in-progress: false
+
+env:
+  CONSOLE_MODE: ${{ vars.CONSOLE_MODE }}
+  CONSOLE_TIMEOUT: ${{ vars.CONSOLE_TIMEOUT }}
+  CONSOLE_IMAGE: ${{ vars.CONSOLE_IMAGE }}
+  CONSOLE_EXTRA_COMMANDS: ${{ vars.CONSOLE_EXTRA_COMMANDS }}
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    # Límite duro de todo el job (setup + ejecución + commit).
+    timeout-minutes: 10
+
+    # Autorización: si CONSOLE_ALLOWED_USERS está vacío, puede ejecutar quien
+    # tenga un token con actions:write sobre el repo (GitHub ya lo impone).
+    # Si está definida (JSON: ["usuario1","usuario2"]), se restringe a ellos.
+    if: ${{ vars.CONSOLE_ALLOWED_USERS == '' || contains(fromJSON(vars.CONSOLE_ALLOWED_USERS), github.actor) }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Instalar herramientas GUI (opcional)
+        if: vars.CONSOLE_INSTALL_GUI_TOOLS == 'true'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xvfb imagemagick x11-apps
+
+      - name: Preparar Docker (solo modo docker)
+        if: vars.CONSOLE_MODE == 'docker'
+        run: docker info
+
+      - name: Ejecutar comando en sandbox
+        env:
+          # El valor de client_payload/command NO se re-evalúa por el shell:
+          # va entre comillas dobles, así que "$COMANDO" llega literal a Python.
+          COMANDO: ${{ github.event.client_payload.command || inputs.command }}
+          RUN_ID: ${{ github.event.client_payload.id || github.run_id }}
+        run: |
+          python3 runner/run_command.py \
+            --id "$RUN_ID" \
+            --command "$COMANDO" \
+            --workspace "$GITHUB_WORKSPACE" \
+            --runs-dir "$GITHUB_WORKSPACE/runs" \
+            --timeout "${CONSOLE_TIMEOUT:-30}" \
+            --mode "${CONSOLE_MODE:-allowlist}" \
+            --image "${CONSOLE_IMAGE:-ubuntu:24.04}" \
+            --actor "${{ github.actor }}" \
+            --stream-interval 3

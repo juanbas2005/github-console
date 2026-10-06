@@ -16,6 +16,7 @@ Flujo:
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import re
@@ -25,6 +26,9 @@ import signal
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -82,8 +86,8 @@ def compute_safe_path() -> str:
     return os.pathsep.join([SAFE_PATH_CORE, *kept])
 SANDBOX_IGNORE = [".git", "runs", ".github", "node_modules", "__pycache__", ".pytest_cache"]
 
-MAX_OUTPUT = 400_000          # 400 KB: run.json debe caber en la API de
-                              # contents (sin contenido inline >1MB)
+MAX_OUTPUT = 250_000          # 250 KB por stream: run.json (base64) debe
+                              # caber en el cuerpo de la Contents API (<1MB)
 MAX_ARTIFACTS = 10
 MAX_ARTIFACT_SIZE = 900_000   # 900 KB: ídem, para poder mostrarlo inline
 
@@ -409,32 +413,38 @@ def collect_artifacts(sandbox: Path, run_dir: Path) -> list:
 # Persistencia (git)
 # --------------------------------------------------------------------------- #
 
-def git_env() -> dict:
-    """Entorno para los subprocesos git. El token viaja por GIT_CONFIG_* (env),
-    nunca en argv (lo vería `ps`) ni en archivos del workspace."""
-    env = dict(os.environ)
+def api_put(path: str, content_b64: str, message: str, sha: str | None = None) -> str:
+    """Sube o actualiza un archivo por la Contents API (PUT). Devuelve el sha.
+
+    Usar la API en vez de `git push` implica que NO hacen falta credenciales
+    git en el workspace: el token solo vive en la memoria de este proceso
+    (nunca en argv —lo vería `ps`—, ni en archivos, ni en el entorno del
+    comando, que está saneado)."""
     token = os.environ.get("GITHUB_TOKEN")
-    if token:
-        env["GIT_CONFIG_COUNT"] = "1"
-        env["GIT_CONFIG_KEY_0"] = "http.https://github.com/.extraheader"
-        env["GIT_CONFIG_VALUE_0"] = f"AUTHORIZATION: Bearer {token}"
-    return env
-
-
-def git_commit(workspace: Path, rel_path: str, message: str) -> None:
-    git = ["git", "-C", str(workspace)]
-    env = git_env()
-    subprocess.run(git + ["add", "-f", "--", rel_path], check=True, capture_output=True)
-    result = subprocess.run(
-        git + ["commit", "-q", "-m", message, "--", rel_path],
-        capture_output=True, text=True, env=env,
+    repo = os.environ.get("GITHUB_REPOSITORY")
+    if not token or not repo:
+        raise RuntimeError("falta GITHUB_TOKEN o GITHUB_REPOSITORY (¿no es un workflow?)")
+    url = (f"https://api.github.com/repos/{repo}/contents/"
+           f"{urllib.parse.quote(path, safe='/')}")
+    body = {"message": message, "content": content_b64}
+    if sha:
+        body["sha"] = sha
+    request = urllib.request.Request(
+        url, data=json.dumps(body).encode(), method="PUT",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "Content-Type": "application/json",
+            "User-Agent": "github-console-runner",
+        },
     )
-    if result.returncode != 0:
-        return  # Nada que commitear (sin cambios)
-    push = subprocess.run(git + ["push", "-q"], capture_output=True, text=True, env=env)
-    if push.returncode != 0:  # ponytail: reintento simple tras rebase
-        subprocess.run(git + ["pull", "-q", "--rebase"], capture_output=True, text=True, env=env)
-        subprocess.run(git + ["push", "-q"], capture_output=True, text=True, env=env)
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return json.loads(response.read())["content"]["sha"]
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")[:300]
+        raise RuntimeError(f"API {exc.code} al subir {path}: {detail}") from exc
 
 
 def write_json(path: Path, payload: dict) -> None:
@@ -463,6 +473,7 @@ def main() -> int:
     runs_dir = Path(args.runs_dir).resolve()
     run_dir = runs_dir / args.id
     run_file = run_dir / "run.json"
+    run_dir.mkdir(parents=True, exist_ok=True)
     rel_run_dir = f"runs/{args.id}"
     allowed = build_allowed_set()
 
@@ -494,36 +505,39 @@ def main() -> int:
         "timeout_seconds": args.timeout,
     }
 
-    # Configura git localmente (idempotente) para los commits de streaming.
-    subprocess.run(["git", "-C", str(workspace), "config", "user.name",
-                    f"{args.actor} (web-console)"], capture_output=True)
-    subprocess.run(["git", "-C", str(workspace), "config", "user.email",
-                    f"{args.actor}@users.noreply.github.com"], capture_output=True)
+    # Sin commits git desde aquí: la salida se publica por la Contents API
+    # (ver api_put), así no hacen falta credenciales git en el workspace.
 
     state = {"stdout": b"", "stderr": b"", "status": "running"}
     last_commit = {"time": time.monotonic(), "sig": None}
+    run_sha = {"sha": None}
+
+    def publish(payload: dict, message: str) -> None:
+        blob = base64.b64encode(
+            json.dumps(payload, ensure_ascii=False).encode("utf-8")).decode()
+        run_sha["sha"] = api_put(f"runs/{args.id}/run.json", blob, message, run_sha["sha"])
 
     def tick(stdout: bytes, stderr: bytes, status: str) -> None:
         state.update(stdout=stdout, stderr=stderr, status=status)
-        write_json(run_file, {
+        payload = {
             **meta,
             "status": status,
             "updated_at": now_iso(),
             "stdout": redact(stdout.decode("utf-8", "replace")),
             "stderr": redact(stderr.decode("utf-8", "replace")),
             "exit_code": None,
-        })
-        # Streaming: commitea solo si cambió la salida y pasó el intervalo.
-        # El commit final es el definitivo; estos son best-effort.
+        }
+        # Streaming: sube solo si cambió la salida y pasó el intervalo.
+        # La subida final es la definitiva; estas son best-effort.
         now = time.monotonic()
         sig = hash((stdout, stderr))
         if sig != last_commit["sig"] and now - last_commit["time"] >= args.stream_interval:
             last_commit["time"] = now
             last_commit["sig"] = sig
             try:
-                git_commit(workspace, rel_run_dir, f"console: streaming {args.id}")
-            except Exception:
-                pass
+                publish(payload, f"console: streaming {args.id}")
+            except Exception as exc:  # no rompe la ejecución por un fallo de red
+                print(f"[console] salida parcial no subida: {exc}", file=sys.stderr)
 
     try:
         sandbox = prepare_sandbox(workspace)
@@ -537,7 +551,9 @@ def main() -> int:
             command_argv = stages
 
         tick(b"", b"", "running")
-        git_commit(workspace, rel_run_dir, f"console: start {args.id}")
+        publish({**meta, "status": "running", "updated_at": now_iso(),
+                 "stdout": "", "stderr": "", "exit_code": None},
+                f"console: start {args.id}")
 
         start = time.monotonic()
         if args.mode == "docker":
@@ -563,7 +579,14 @@ def main() -> int:
             "artifacts": artifacts,
         }
         write_json(run_file, final)
-        git_commit(workspace, rel_run_dir, f"console: {status} {args.id} (exit {exit_code})")
+        publish(final, f"console: {status} {args.id} (exit {exit_code})")
+        for art in artifacts:  # artefactos (capturas, archivos) junto al run
+            try:
+                blob = base64.b64encode((run_dir / art["name"]).read_bytes()).decode()
+                api_put(f"runs/{args.id}/{urllib.parse.quote(art['name'])}", blob,
+                        f"console: artifact {art['name']}")
+            except Exception as exc:
+                print(f"[console] artefacto {art['name']} no subido: {exc}", file=sys.stderr)
         print(f"[console] run {args.id} -> {status} exit={exit_code} "
               f"duration={duration_ms}ms artifacts={len(artifacts)}")
         return 0
@@ -576,7 +599,10 @@ def main() -> int:
             "artifacts": [],
         }
         write_json(run_file, final)
-        git_commit(workspace, rel_run_dir, f"console: rejected {args.id}")
+        try:
+            publish(final, f"console: rejected {args.id}")
+        except Exception as exc:
+            print(f"[console] no se pudo subir el rechazo: {exc}", file=sys.stderr)
         print(f"[console] run {args.id} REJECTED: {exc}")
         return 0  # No falla el workflow: el rechazo se muestra en el frontend.
     except Exception as exc:  # Error interno: sí falla el workflow.
@@ -587,12 +613,12 @@ def main() -> int:
             **meta, "status": "error", "stdout": "", "stderr": "",
             "error": f"error interno del runner: {exc}", "artifacts": [],
         })
-        subprocess.run(["git", "-C", str(workspace), "add", "--", rel_run_dir],
-                       capture_output=True)
-        subprocess.run(["git", "-C", str(workspace), "commit", "-q", "-m",
-                        f"console: error {args.id}"], capture_output=True, env=git_env())
-        subprocess.run(["git", "-C", str(workspace), "push", "-q"],
-                       capture_output=True, env=git_env())
+        try:
+            publish({**meta, "status": "error", "stdout": "", "stderr": "",
+                     "error": f"error interno del runner: {exc}", "artifacts": []},
+                    f"console: error {args.id}")
+        except Exception:
+            pass
         return 2
     finally:
         sandbox_dir = os.environ.get("CONSOLE_SANDBOX_DIR")

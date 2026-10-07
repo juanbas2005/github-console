@@ -29,6 +29,7 @@ const state = {
   history: [],
   histIndex: -1,
   active: new Set(),
+  busy: false,
 };
 
 /* ----------------------------------------------------------------- utils */
@@ -314,6 +315,13 @@ async function runRemote(command) {
     return;
   }
   let runId;
+  if (state.busy) {
+    printText("⏳ Ya hay un comando en ejecución. Este repo permite solo 1 a la "
+      + "vez (grupo de concurrencia); los envíos concurrentes GitHub los cancela. "
+      + "Espera a que termine.", "error");
+    return;
+  }
+  state.busy = true;  // síncrono: evita que dos comandos rápidos pasen el chequeo
   try {
     runId = await dispatch(command);
   } catch (e) {
@@ -333,6 +341,7 @@ async function runRemote(command) {
     await pollRun(runId, outLine, startedAt);
   } finally {
     state.active.delete(runId);
+    state.busy = false;
   }
 }
 

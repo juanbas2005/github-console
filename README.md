@@ -28,27 +28,35 @@ API + polling de un archivo commiteado**:
 │                            │        │  (ubuntu-latest, sandboxeado)       │
 │                            │        │        │                            │
 │                            │        │        ▼  cada ~3 s                 │
-│ ②  GET /contents/runs/<id>/│        │  git commit runs/<id>/run.json      │
+│ ③  GET /contents/runs/<id>/│        │  PUT /contents/runs/<id>/run.json  │
 │      run.json  ◀───────────┼────────│  (stdout/stderr/exit/artefactos)    │
-│      (polling cada 3 s)    │        │                                     │
+│      (polling cada 3 s)    │        │  con un token efímero que se borra │
+│                            │        │  antes de ejecutar el comando       │
 └────────────────────────────┘        └─────────────────────────────────────┘
 ```
 
 **Latencia típica: 3–6 s** entre que se produce la salida y la ves (polling +
-commit). No es streaming real; es "casi tiempo real". Ver §7 para alternativas.
+subida por API). No es streaming real; es "casi tiempo real". Ver §7 para
+alternativas.
+
+> **Detalle clave**: la salida se publica con la **Contents API** (no con
+> `git push`), usando un token efímero escrito en un archivo de permisos `600`
+> que el runner **lee y borra antes de ejecutar nada**. Así el token nunca está
+> en el entorno del proceso (sería legible vía `/proc/<pid>/environ`) ni en
+> archivos del workspace.
 
 ### Componentes
 
 | Carpeta/archivo | Qué es |
 |---|---|
 | `web/` | Frontend estático: `index.html`, `app.js`, `styles.css`, `config.js`. Se publica tal cual en Pages. |
-| `runner/run_command.py` | El "backend": valida, sandboxea, ejecuta y commitea la salida. Corre *dentro* del runner. Solo stdlib. |
+| `runner/run_command.py` | El "backend": valida, sandboxea, ejecuta y sube la salida por la Contents API. Corre *dentro* del runner. Solo stdlib. |
 | `runner/prune_runs.py` | Poda `runs/` antiguo (cron diario). |
 | `.github/workflows/console-run.yml` | Ejecuta comandos (`repository_dispatch`). |
 | `.github/workflows/deploy-pages.yml` | Publica `web/` en Pages. |
 | `.github/workflows/cleanup-runs.yml` | Limpieza programada de `runs/`. |
 | `examples/` | Scripts de ejemplo (bash, python, GUI con Xvfb). |
-| `runs/<id>/` | Salida de cada ejecución (JSON + artefactos). Se commitea aquí. |
+| `runs/<id>/` | Salida de cada ejecución (JSON + artefactos). Se publica en esta ruta por la API. |
 
 ---
 
@@ -140,6 +148,7 @@ env | grep -i token           # ⚡ no imprime nada: el entorno está saneado
 python3 examples/colors.py    # salida ANSI + barra de progreso (streaming)
 bash examples/sysinfo.sh      # info completa del runner
 bash examples/gui_screenshot.sh   # GUI con Xvfb → captura PNG incrustada
+python3 examples/proc_probe.py    # autodiagnóstico de aislamiento ⚡
 cat examples/hello.sh         # leer archivos del repo
 curl -s https://api.github.com/zen   # salida a Internet del runner
 ```
@@ -161,9 +170,9 @@ comandos): esa es la frontera de seguridad principal.
 |---|---|
 | **Ejecución de código arbitrario** | Modo `allowlist`: solo binarios de una lista blanca, argv directo (**sin shell**), sin `-c`/`-e`/`-m`, sin metacaracteres (`; & \| $ \` > < \`), intérpretes limitados a scripts del repo. |
 | **Inyección de shell** | No se usa `shell=True` en ningún punto: `subprocess.Popen(argv)` con argv validado. |
-| **Robo del `GITHUB_TOKEN`** | El comando se ejecuta en una **copia del repo sin `.git`** (allí está el token), con **entorno saneado** (solo variables inocuas; ni `GITHUB_TOKEN` ni secretos) y en un **namespace PID+mount propio** (`unshare`) para que no pueda leer `/proc/<ancestro>/environ`. |
-| **Fuga de tokens en la salida** | Antes de commitearse, la salida se redacta (regex para `ghp_…`, `github_pat_…`, `gho_/ghs_/ghu_/ghr_…` y tokens hex de 40 chars, sin falsos positivos en hashes largos). |
-| **Abuso (mining, spam, costes)** | `concurrency` con grupo único (**1 trabajo a la vez**), `timeout-minutes` del job, `timeout` por comando, `ulimit` (CPU, tamaño de archivo, memoria virtual), salida truncada a 400 KB. |
+| Robo del `GITHUB_TOKEN` | El comando se ejecuta en una **copia del repo sin `.git`**; el workflow **borra el `extraheader`** que `actions/checkout` deja en `.git/config`; y la salida se sube con un **token efímero** (archivo `600` que el runner lee y elimina antes de ejecutar) que **nunca está en el entorno del proceso**. Sin esto, en los runners hosted el token SÍ es legible vía `/proc/<pid>/environ` (verificado con `examples/proc_probe.py`). |
+| **Token en la salida pública** | Antes de subirse, la salida se redacta (regex para `ghp_…`, `github_pat_…`, `gho_/ghs_/ghu_/ghr_…` y tokens hex de 40 chars, sin falsos positivos en hashes largos). Doble red de seguridad por si un script imprime un token por accidente. |
+| **Abuso (mining, spam, costes)** | `concurrency` con grupo único (**1 trabajo a la vez**; los dispatches simultáneos adicionales GitHub los *cancela*), `timeout-minutes` del job, `timeout` por comando, `ulimit` (CPU, tamaño de archivo, memoria virtual), salida truncada. La web bloquea enviar un segundo comando mientras hay uno en curso. |
 | **Acceso no autorizado** | Disparar el workflow requiere un token con `Actions: write` **sobre este repo** — GitHub lo impone. Opcionalmente restringe con la variable `CONSOLE_ALLOWED_USERS` (se valida `github.actor` en el workflow, no es falsificable desde el navegador). |
 | **Token expuesto en la web** | El token **no está en el repo ni en el código**. Vive en `localStorage` y solo viaja a `api.github.com`. Si la página es pública, cualquiera puede *abrir la página*, pero necesita su propio token válido para ejecutar algo. |
 | **Secretos del workflow** | No se inyectan en el entorno del comando. Si necesitas que un script use un secreto, hazlo explícito (y asume que la salida es pública). |
@@ -173,9 +182,16 @@ comandos): esa es la frontera de seguridad principal.
 - El token en `localStorage` es tan seguro como la sesión de tu navegador.
   Cualquiera que use tu navegador puede ejecutar comandos con tu identidad.
   Cierra sesión / borra el token en una máquina compartida.
-- El sandbox de modo `allowlist` aísla del *repo y sus secretos*, pero el
+- El sandbox de modo `allowlist` aísla del *repo y sus credenciales*, pero el
   comando sigue siendo del usuario autorizado: si ese usuario es malintencionado,
   el daño está limitado por la lista blanca y los recursos, no por un contenedor.
+- **Residual demostrado en runners hosted**: no hay aislamiento por namespace
+  (los user namespaces están deshabilitados y el job no es root), y `/proc/<pid>/environ`
+  de procesos ancestros ES legible. Por eso el token va por archivo efímero y
+  no en el entorno. Queda la posibilidad teórica de *memory scraping* leyendo
+  `/proc/<ppid>/mem`: es un ataque deliberado y difícil, equivalente en
+  privilegio a añadir un workflow tuyo (cosa que cualquier colaborador con
+  `Actions: write` ya puede hacer). Para código no confiable → modo `docker`.
 - Para código verdaderamente arbitrario y no confiable → modo `docker` (§5).
 
 ---
@@ -256,8 +272,8 @@ docker run --rm --network none --memory 512m --memory-swap 512m --cpus 1 \
 | **1 ejecución a la vez** | `concurrency.group: console-run` serializa. Las demás se encolan. | Varios grupos (`console-run-${{ github.actor }}`) si quieres paralelismo por usuario. |
 | **Límite de Actions** | 6 h por job; minutos consumidos de tu cuota (gratis en repos públicos). | `CONSOLE_TIMEOUT` y `timeout-minutes` ya limitan. |
 | **`runs/` crece en git** | Cada ejecución commitea archivos. | `cleanup-runs.yml` poda a diario (`CONSOLE_RUNS_RETENTION_DAYS`). |
+| **Salida truncada a 250 KB por stream** | La Contents API limita el cuerpo a 1 MB (base64 incluido). | Vuelve a ejecutar con `head` o escribe a un artefacto. |
 | **Artefactos inline < 900 KB** | La API de contents no devuelve archivos > 1 MB inline. | La web cae a la blob API automáticamente; para archivos muy grandes usa artifacts de Actions. |
-| **Salida truncada a 400 KB** | Por la misma razón. | Vuelve a ejecutar con `| head` o redirige a un artefacto. |
 | **`repository_dispatch` solo en la rama por defecto** | Si el workflow no está en `main`, no se dispara. | Mantén los workflows en `main`. |
 | **Polling consume API** | ~1 llamada cada 3 s mientras corre (5000/h con token). | Sube `pollIntervalMs` en `config.js` si lo necesitas. |
 
@@ -320,10 +336,12 @@ repo o crea un workflow dedicado que la instale.
 el job sigue en el runner hasta que termina o agota `CONSOLE_TIMEOUT`. Cancelar
 el job vía API queda como ejercicio (necesitarías mapear run → `actions/runs/<id>`).
 
-**¿Por qué `runs/` se commitea en vez de usar artifacts?** Descargar artifacts
-desde el navegador requiere auth y una redirección que el navegador sigue sin el
-header `Authorization`. Commitear a git es el único canal legible por una página
-estática sin servidor.
+**¿Por qué la salida se sube por la Contents API y no con artifacts/git push?**
+Descargar artifacts desde el navegador requiere auth y una redirección que el
+navegador sigue sin el header `Authorization`; y hacer `git push` desde el runner
+requeriría dejar credenciales en el workspace o en el entorno del proceso
+(legibles por el comando vía `/proc`). La Contents API sube el archivo y queda
+listo para que la página estática lo lea, con el token efímero ya borrado.
 
 ---
 

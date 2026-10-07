@@ -62,12 +62,15 @@ jobs:
 
       - name: Ejecutar comando en sandbox
         env:
+          # Se pasa explícitamente: la api_put del runner lo necesita para
+          # subir la salida por la Contents API. Solo vive en el entorno de
+          # ESTE proceso (el del comando ejecutado está saneado).
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # El valor de client_payload/command NO se re-evalúa por el shell:
           # va entre comillas dobles, así que "$COMANDO" llega literal a Python.
           COMANDO: ${{ github.event.client_payload.command || inputs.command }}
           RUN_ID: ${{ github.event.client_payload.id || github.run_id }}
         run: |
-          echo "diag: token=${GITHUB_TOKEN:+present} repo=$GITHUB_REPOSITORY runid=$GITHUB_RUN_ID"
           python3 runner/run_command.py \
             --id "$RUN_ID" \
             --command "$COMANDO" \

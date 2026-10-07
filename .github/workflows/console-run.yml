@@ -67,6 +67,7 @@ jobs:
           COMANDO: ${{ github.event.client_payload.command || inputs.command }}
           RUN_ID: ${{ github.event.client_payload.id || github.run_id }}
         run: |
+          echo "diag: token=${GITHUB_TOKEN:+present} repo=$GITHUB_REPOSITORY runid=$GITHUB_RUN_ID"
           python3 runner/run_command.py \
             --id "$RUN_ID" \
             --command "$COMANDO" \

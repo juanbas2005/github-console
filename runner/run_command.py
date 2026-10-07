@@ -413,17 +413,45 @@ def collect_artifacts(sandbox: Path, run_dir: Path) -> list:
 # Persistencia (git)
 # --------------------------------------------------------------------------- #
 
+_TOKEN = ""
+
+
+def set_token(value: str) -> None:
+    global _TOKEN
+    _TOKEN = value
+
+
+def load_token() -> str:
+    """Lee el token del archivo efímero y lo borra de inmediato.
+
+    Así el token nunca está en el entorno del proceso (sería legible vía
+    /proc/<pid>/environ) ni en un archivo alcanzable por ruta absoluta.
+    """
+    path = os.environ.get("CONSOLE_TOKEN_FILE")
+    if not path:
+        # Solo para pruebas locales sin workflow.
+        return os.environ.get("GITHUB_TOKEN", "")
+    try:
+        token = Path(path).read_text(encoding="utf-8").strip()
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    return token
+
+
 def api_put(path: str, content_b64: str, message: str, sha: str | None = None) -> str:
     """Sube o actualiza un archivo por la Contents API (PUT). Devuelve el sha.
 
     Usar la API en vez de `git push` implica que NO hacen falta credenciales
     git en el workspace: el token solo vive en la memoria de este proceso
-    (nunca en argv —lo vería `ps`—, ni en archivos, ni en el entorno del
-    comando, que está saneado)."""
-    token = os.environ.get("GITHUB_TOKEN")
+    (nunca en argv —lo vería `ps`—, ni en archivos, ni en el entorno, que está
+    saneado)."""
+    token = _TOKEN or os.environ.get("GITHUB_TOKEN", "")
     repo = os.environ.get("GITHUB_REPOSITORY")
     if not token or not repo:
-        raise RuntimeError("falta GITHUB_TOKEN o GITHUB_REPOSITORY (¿no es un workflow?)")
+        raise RuntimeError("falta token (CONSOLE_TOKEN_FILE) o GITHUB_REPOSITORY")
     url = (f"https://api.github.com/repos/{repo}/contents/"
            f"{urllib.parse.quote(path, safe='/')}")
     body = {"message": message, "content": content_b64}
@@ -476,6 +504,7 @@ def main() -> int:
     run_dir.mkdir(parents=True, exist_ok=True)
     rel_run_dir = f"runs/{args.id}"
     allowed = build_allowed_set()
+    set_token(load_token())  # lee y borra el archivo efímero; nada en el entorno
 
     meta = {
         "id": args.id,

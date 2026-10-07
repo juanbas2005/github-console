@@ -60,12 +60,23 @@ jobs:
         if: vars.CONSOLE_MODE == 'docker'
         run: docker info
 
+      # El token NO viaja en el entorno del paso principal (sería legible vía
+      # /proc/<pid>/environ desde el propio comando: el runner hosted no aísla
+      # por namespace). Se escribe en un archivo efímero con permisos 600 que el
+      # runner lee y BORRA antes de ejecutar cualquier cosa.
+      - name: Preparar token efímero
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          umask 077
+          TOKEN_FILE="$RUNNER_TEMP/console-token.$RANDOM$$"
+          printf '%s' "$GITHUB_TOKEN" > "$TOKEN_FILE"
+          echo "CONSOLE_TOKEN_FILE=$TOKEN_FILE" >> "$GITHUB_ENV"
+
       - name: Ejecutar comando en sandbox
         env:
-          # Se pasa explícitamente: la api_put del runner lo necesita para
-          # subir la salida por la Contents API. Solo vive en el entorno de
-          # ESTE proceso (el del comando ejecutado está saneado).
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # CONSOLE_TOKEN_FILE es solo una RUTA (inofensiva). El token en sí
+          # nunca está en el entorno de este paso.
           # El valor de client_payload/command NO se re-evalúa por el shell:
           # va entre comillas dobles, así que "$COMANDO" llega literal a Python.
           COMANDO: ${{ github.event.client_payload.command || inputs.command }}
